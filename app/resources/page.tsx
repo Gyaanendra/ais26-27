@@ -216,7 +216,7 @@ const PUBLISHED_ARTICLES: ArticleMeta[] = [
     title: "The Transformer: Attention Is All You Need",
     subtitle:
       "Eliminating recurrence with constant-path multi-head self-attention. Interactive dual-tower architecture, coreference attention simulator, and autoregressive generation.",
-    readTime: "16 min read",
+    readTime: "12 min read",
     date: "September 2026",
     author: "AIS Research Cohort",
     status: "PUBLISHED",
