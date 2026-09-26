@@ -237,6 +237,257 @@ const CATEGORIES = [
   "SEQUENTIAL",
 ] as const;
 
+// ── Transformer Causal Attention Matrix Picker (Card 16) ──
+const TRANSFORMER_MATRIX_TOKENS = [
+  "The",
+  "neural",
+  "network",
+  "learns",
+  "fast",
+] as const;
+
+interface MatrixCellData {
+  weight: string;
+  score: string;
+  isMasked: boolean;
+  bgOpacity: number;
+}
+
+const TRANSFORMER_MATRIX_DATA: readonly (readonly MatrixCellData[])[] = [
+  // Row 0: The
+  [
+    { weight: "100%", score: "3.0", isMasked: false, bgOpacity: 0.8 },
+    { weight: "-∞", score: "mask", isMasked: true, bgOpacity: 0 },
+    { weight: "-∞", score: "mask", isMasked: true, bgOpacity: 0 },
+    { weight: "-∞", score: "mask", isMasked: true, bgOpacity: 0 },
+    { weight: "-∞", score: "mask", isMasked: true, bgOpacity: 0 },
+  ],
+  // Row 1: neural
+  [
+    { weight: "6%", score: "1.3", isMasked: false, bgOpacity: 0.08 },
+    { weight: "94%", score: "4.0", isMasked: false, bgOpacity: 0.78 },
+    { weight: "-∞", score: "mask", isMasked: true, bgOpacity: 0 },
+    { weight: "-∞", score: "mask", isMasked: true, bgOpacity: 0 },
+    { weight: "-∞", score: "mask", isMasked: true, bgOpacity: 0 },
+  ],
+  // Row 2: network
+  [
+    { weight: "2%", score: "0.9", isMasked: false, bgOpacity: 0.06 },
+    { weight: "26%", score: "3.5", isMasked: false, bgOpacity: 0.35 },
+    { weight: "72%", score: "4.5", isMasked: false, bgOpacity: 0.65 },
+    { weight: "-∞", score: "mask", isMasked: true, bgOpacity: 0 },
+    { weight: "-∞", score: "mask", isMasked: true, bgOpacity: 0 },
+  ],
+  // Row 3: learns
+  [
+    { weight: "3%", score: "0.6", isMasked: false, bgOpacity: 0.06 },
+    { weight: "7%", score: "1.4", isMasked: false, bgOpacity: 0.12 },
+    { weight: "16%", score: "2.3", isMasked: false, bgOpacity: 0.22 },
+    { weight: "74%", score: "3.8", isMasked: false, bgOpacity: 0.68 },
+    { weight: "-∞", score: "mask", isMasked: true, bgOpacity: 0 },
+  ],
+  // Row 4: fast
+  [
+    { weight: "1%", score: "0.3", isMasked: false, bgOpacity: 0.04 },
+    { weight: "2%", score: "0.8", isMasked: false, bgOpacity: 0.06 },
+    { weight: "4%", score: "1.3", isMasked: false, bgOpacity: 0.08 },
+    { weight: "20%", score: "3.0", isMasked: false, bgOpacity: 0.25 },
+    { weight: "73%", score: "4.3", isMasked: false, bgOpacity: 0.68 },
+  ],
+];
+
+function TransformersAttentionPicker() {
+  const [activeCell, setActiveCell] = useState<{ row: number; col: number }>({
+    row: 2,
+    col: 1,
+  });
+
+  return (
+    <svg
+      viewBox="0 0 280 152"
+      className="w-full max-w-[270px] h-auto select-none relative z-10"
+      style={{ fontFamily: "monospace" }}
+      role="img"
+      aria-label="Transformer Causal Attention Matrix Picker"
+    >
+      <title>Transformer Causal Attention Matrix Picker</title>
+      {/* Top Left Header */}
+      <text
+        x="22"
+        y="14"
+        fill="#75716B"
+        fontSize="7.5"
+        textAnchor="middle"
+        fontWeight="bold"
+      >
+        Q \ K
+      </text>
+
+      {/* Column Headers (Keys) */}
+      {TRANSFORMER_MATRIX_TOKENS.map((token, ci) => {
+        const isColActive = activeCell.col === ci;
+        const xCenter = 68 + ci * 46;
+        return (
+          <g
+            key={`col-hdr-${token}`}
+            className="cursor-pointer"
+            onClick={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              setActiveCell((prev) => ({ ...prev, col: ci }));
+            }}
+          >
+            {isColActive && (
+              <rect
+                x={xCenter - 21}
+                y="3"
+                width="42"
+                height="15"
+                rx="2"
+                fill="#DE5D35"
+              />
+            )}
+            <text
+              x={xCenter}
+              y="14"
+              fill={isColActive ? "#FAF9F5" : "#1A1816"}
+              fontSize="7.5"
+              fontWeight="bold"
+              textAnchor="middle"
+            >
+              {token}
+            </text>
+          </g>
+        );
+      })}
+
+      {/* Matrix Rows (Queries) */}
+      {TRANSFORMER_MATRIX_TOKENS.map((qToken, ri) => {
+        const isRowActive = activeCell.row === ri;
+        const yTop = 22 + ri * 25;
+        const yCenter = yTop + 14;
+
+        return (
+          <g key={`row-${qToken}`}>
+            {/* Row Header */}
+            <g
+              className="cursor-pointer"
+              onClick={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                setActiveCell((prev) => ({ ...prev, row: ri }));
+              }}
+            >
+              {isRowActive && (
+                <rect
+                  x="2"
+                  y={yTop + 1}
+                  width="41"
+                  height="22"
+                  rx="2"
+                  fill="#DE5D35"
+                />
+              )}
+              <text
+                x="22"
+                y={yCenter}
+                fill={isRowActive ? "#FAF9F5" : "#1A1816"}
+                fontSize="7.5"
+                fontWeight="bold"
+                textAnchor="middle"
+              >
+                {qToken}
+              </text>
+            </g>
+
+            {/* Row Cells */}
+            {TRANSFORMER_MATRIX_DATA[ri].map((cell, ci) => {
+              const isSelected = activeCell.row === ri && activeCell.col === ci;
+              const cellX = 47 + ci * 46;
+              const cellY = yTop + 1;
+              const colToken = TRANSFORMER_MATRIX_TOKENS[ci];
+              const fill = cell.isMasked
+                ? "#FAF9F5"
+                : `rgba(222, 93, 53, ${cell.bgOpacity})`;
+
+              return (
+                <g
+                  key={`cell-${qToken}-${colToken}`}
+                  className="cursor-pointer"
+                  onClick={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    setActiveCell({ row: ri, col: ci });
+                  }}
+                >
+                  <rect
+                    x={cellX}
+                    y={cellY}
+                    width="42"
+                    height="22"
+                    rx="2"
+                    fill={fill}
+                    stroke={isSelected ? "#DE5D35" : "#1A1816"}
+                    strokeWidth={isSelected ? "1.8" : "0.5"}
+                    strokeOpacity={isSelected ? 1 : 0.2}
+                  />
+                  {cell.isMasked ? (
+                    <>
+                      <text
+                        x={cellX + 21}
+                        y={cellY + 10}
+                        textAnchor="middle"
+                        fill="#DE5D35"
+                        fontSize="8"
+                        fontWeight="bold"
+                      >
+                        -∞
+                      </text>
+                      <text
+                        x={cellX + 21}
+                        y={cellY + 18}
+                        textAnchor="middle"
+                        fill="#DE5D35"
+                        opacity="0.65"
+                        fontSize="6"
+                      >
+                        mask
+                      </text>
+                    </>
+                  ) : (
+                    <>
+                      <text
+                        x={cellX + 21}
+                        y={cellY + 10}
+                        textAnchor="middle"
+                        fill={cell.bgOpacity > 0.5 ? "#FAF9F5" : "#1A1816"}
+                        fontSize="8"
+                        fontWeight="bold"
+                      >
+                        {cell.weight}
+                      </text>
+                      <text
+                        x={cellX + 21}
+                        y={cellY + 18}
+                        textAnchor="middle"
+                        fill={cell.bgOpacity > 0.5 ? "#FAF9F5" : "#1A1816"}
+                        opacity="0.75"
+                        fontSize="6"
+                      >
+                        {cell.score}
+                      </text>
+                    </>
+                  )}
+                </g>
+              );
+            })}
+          </g>
+        );
+      })}
+    </svg>
+  );
+}
+
 export default function ResourcesPage() {
   const [selectedCategory, setSelectedCategory] = useState<string>("ALL");
   const [searchQuery, setSearchQuery] = useState<string>("");
@@ -297,7 +548,7 @@ export default function ResourcesPage() {
                 </span>
               </div>
               <span className="text-[10px] font-mono text-[#75716B]">
-                15 MODULES · FIRST PRINCIPLES
+                16 MODULES · FIRST PRINCIPLES
               </span>
             </div>
             <div className="flex flex-wrap items-center gap-x-2 gap-y-1.5 text-[11px] font-mono">
@@ -352,6 +603,13 @@ export default function ResourcesPage() {
               <span className="font-bold text-[#1A1816] bg-[#1A1816]/5 px-1.5 py-0.5 rounded-[1px]">
                 13 Reinforcement Learning
               </span>
+              <span className="text-[#DE5D35] font-bold">→</span>
+              <Link
+                href="/resources/transformers"
+                className="font-bold text-[#DE5D35] bg-[#DE5D35]/10 px-1.5 py-0.5 rounded-[1px] hover:bg-[#DE5D35] hover:text-[#FAF9F5] transition-colors"
+              >
+                16 The Transformer: Attention Is All You Need
+              </Link>
             </div>
           </div>
 
@@ -1701,6 +1959,11 @@ export default function ResourcesPage() {
                           REWARD
                         </text>
                       </svg>
+                    )}
+
+                    {/* 16: THE TRANSFORMER (ATTENTION MATRIX PICKER) */}
+                    {article.slug === "transformers" && (
+                      <TransformersAttentionPicker />
                     )}
 
                     {/* Corner Index */}
