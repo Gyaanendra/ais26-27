@@ -8,6 +8,13 @@ import MathTex from "@/components/MathTex";
 // ─────────────────────────────────────────────────────────────────────────────
 // Types & Static Constants (lifted outside component to prevent re-allocation)
 // ─────────────────────────────────────────────────────────────────────────────
+interface SubwordToken {
+  pos: number;
+  text: string;
+  id: number;
+  bytes: string;
+}
+
 interface VecToken {
   text: string;
   id: number;
@@ -187,9 +194,9 @@ const AR_SEQUENCE = [
     stepIdx: 0,
     token: "<BOS>",
     logits: [
-      { word: "The", p: "88%" },
-      { word: "Attention", p: "8%" },
-      { word: "A", p: "4%" },
+      { word: "Attention", p: "62%" },
+      { word: "The", p: "30%" },
+      { word: "A", p: "8%" },
     ],
   },
   {
@@ -266,6 +273,44 @@ function computeAttentionWeights(idx: number, head: number): readonly number[] {
   return SENTENCE_TOKENS.map((t) => (t.idx === idx ? 0.65 : remainingShare));
 }
 
+// UTF-8 byte view of a token (charCodeAt would give UTF-16 code units)
+const utf8Encoder = new TextEncoder();
+function toUtf8Hex(text: string): string {
+  return Array.from(utf8Encoder.encode(text))
+    .map((b) => b.toString(16).padStart(2, "0").toUpperCase())
+    .join(" ");
+}
+
+// Toy position-wise FFN hidden layer: 2048 neurons with fixed pseudo-random
+// weights w ~ N(0, 1) and biases b ~ N(-1, 0.3), so the demo computes real
+// activations instead of scaling a made-up count.
+const FFN_HIDDEN_DIM = 2048;
+const FFN_TOY_NEURONS = (() => {
+  let seed = 42;
+  const rand = () => {
+    seed = (seed + 0x6d2b79f5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+  const gauss = () =>
+    Math.sqrt(-2 * Math.log(1 - rand())) * Math.cos(2 * Math.PI * rand());
+  return Array.from({ length: FFN_HIDDEN_DIM }, () => ({
+    w: gauss(),
+    b: -1 + 0.3 * gauss(),
+  }));
+})();
+
+function gelu(z: number): number {
+  return (
+    0.5 * z * (1 + Math.tanh(Math.sqrt(2 / Math.PI) * (z + 0.044715 * z ** 3)))
+  );
+}
+
+// d_model = 512; pairs of (sin, cos) dimensions plotted in the PE canvas
+const PE_D_MODEL = 512;
+const PE_PLOTTED_DIMS = [0, 32, 64, 128] as const;
+
 // 2D Cartesian helper for the angle arc sector path between two vectors
 function getAngleArcSector(
   xA: number,
@@ -309,18 +354,14 @@ function getAngleMidpoint(
 }
 
 export default function TransformersArticlePage() {
-  // ── 1. BPE Tokenizer State ──
+  // ── 1. Subword Tokenizer State ──
   const [customText, setCustomText] = useState(
     "Attention is all you need for neural sequence transduction",
   );
-  const [tokens, setTokens] = useState<
-    { text: string; id: number; bytes: string }[]
-  >([]);
-  const [inspectedToken, setInspectedToken] = useState<{
-    text: string;
-    id: number;
-    bytes: string;
-  } | null>(null);
+  const [tokens, setTokens] = useState<SubwordToken[]>([]);
+  const [inspectedToken, setInspectedToken] = useState<SubwordToken | null>(
+    null,
+  );
 
   // ── 2. 2D Semantic Plane Interactive State ──
   const [vecMode, setVecMode] = useState<"static" | "context" | "autoregress">(
@@ -382,8 +423,6 @@ export default function TransformersArticlePage() {
   // ── 3. Positional Encoding Canvas State ──
   const posCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const [posSeqLen, setPosSeqLen] = useState<number>(20);
-  const posSeqLenRef = useRef(posSeqLen);
-  posSeqLenRef.current = posSeqLen;
 
   // ── 4. Coreference Attention Simulator State ──
   const [selectedAttentionIdx, setSelectedAttentionIdx] = useState<number>(7);
@@ -489,7 +528,7 @@ export default function TransformersArticlePage() {
     });
   }, [temperature, topK, samplingMethod]);
 
-  // ── Simple BPE Tokenization Rule Simulator ──
+  // ── Simplified Subword Splitter (illustrative, not a trained BPE vocab) ──
   const runTokenizer = useCallback((textToTokenize: string) => {
     const trimmed = textToTokenize.trim();
     if (!trimmed) {
@@ -498,133 +537,71 @@ export default function TransformersArticlePage() {
       return;
     }
 
-    const rawWords = trimmed.split(/\s+/);
-    const subwords: { text: string; id: number; bytes: string }[] = [];
+    const hashId = (text: string) => {
+      let h = 11;
+      for (let i = 0; i < text.length; i++) {
+        h = (h * 31 + text.charCodeAt(i)) | 0;
+      }
+      return Math.abs(h) % 37000;
+    };
 
-    for (const word of rawWords) {
+    const subwords: SubwordToken[] = [];
+    for (const word of trimmed.split(/\s+/)) {
       const lower = word.toLowerCase().replace(/[^\p{L}\p{N}']/gu, "");
       if (!lower) continue;
 
-      if (lower.length > 7) {
-        const part1 = lower.slice(0, 5);
-        const part2 = `##${lower.slice(5)}`;
-
-        let h1 = 7;
-        for (let i = 0; i < part1.length; i++) {
-          h1 = (h1 * 31 + part1.charCodeAt(i)) | 0;
-        }
-        let h2 = 13;
-        for (let i = 0; i < part2.length; i++) {
-          h2 = (h2 * 31 + part2.charCodeAt(i)) | 0;
-        }
-
-        const hash1 = Math.abs(h1) % 32000;
-        const hash2 = Math.abs(h2) % 32000;
-
-        const bytes1 = Array.from(part1)
-          .map((c) =>
-            c.charCodeAt(0).toString(16).padStart(2, "0").toUpperCase(),
-          )
-          .join(" ");
-        const bytes2 = Array.from(part2)
-          .map((c) =>
-            c.charCodeAt(0).toString(16).padStart(2, "0").toUpperCase(),
-          )
-          .join(" ");
-
-        subwords.push({ text: part1, id: hash1, bytes: bytes1 });
-        subwords.push({ text: part2, id: hash2, bytes: bytes2 });
-      } else {
-        let h = 11;
-        for (let i = 0; i < lower.length; i++) {
-          h = (h * 31 + lower.charCodeAt(i)) | 0;
-        }
-        const hash = Math.abs(h) % 32000;
-        const bytes = Array.from(lower)
-          .map((c) =>
-            c.charCodeAt(0).toString(16).padStart(2, "0").toUpperCase(),
-          )
-          .join(" ");
-        subwords.push({ text: lower, id: hash, bytes });
+      const parts =
+        lower.length > 7 ? [lower.slice(0, 5), lower.slice(5)] : [lower];
+      for (const text of parts) {
+        subwords.push({
+          pos: subwords.length,
+          text,
+          id: hashId(text),
+          bytes: toUtf8Hex(text),
+        });
       }
     }
 
     setTokens(subwords);
-    if (subwords.length > 0) {
-      setInspectedToken(subwords[0]);
-    } else {
-      setInspectedToken(null);
-    }
+    setInspectedToken(subwords[0] ?? null);
   }, []);
 
   useEffect(() => {
     runTokenizer(customText);
   }, [runTokenizer, customText]);
 
-  // ── Positional Encoding Spectrum Wave Renderer (Warm Editorial 2D Theme) ──
+  // ── Positional Encoding Renderer: plots the actual PE(pos, 2i) / PE(pos, 2i+1)
+  //    values for a few dimension pairs across positions 0..posSeqLen ──
   useEffect(() => {
     const canvas = posCanvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
-    let animId: number;
-    let waveOffset = 0;
-
-    let width = Math.max(300, canvas.clientWidth || 800);
-    let height = Math.max(120, canvas.clientHeight || 180);
-    let dpr = window.devicePixelRatio || 1;
-
-    const updateWaveDimensions = () => {
-      dpr = window.devicePixelRatio || 1;
+    const draw = () => {
+      const dpr = window.devicePixelRatio || 1;
       const rect = canvas.getBoundingClientRect();
-      width = Math.max(300, Math.floor(rect.width) || 800);
-      height = Math.max(120, Math.floor(rect.height) || 180);
+      const width = Math.max(300, Math.floor(rect.width) || 800);
+      const height = Math.max(120, Math.floor(rect.height) || 180);
       canvas.width = Math.floor(width * dpr);
       canvas.height = Math.floor(height * dpr);
-    };
 
-    updateWaveDimensions();
-
-    const resizeObserver = new ResizeObserver(() => {
-      updateWaveDimensions();
-    });
-    resizeObserver.observe(canvas);
-
-    const renderWave = () => {
-      const curPosSeqLen = posSeqLenRef.current;
       ctx.save();
       ctx.scale(dpr, dpr);
-      ctx.clearRect(0, 0, width, height);
-
-      // Warm editorial inner stage ground
       ctx.fillStyle = "#F4F1EA";
       ctx.fillRect(0, 0, width, height);
 
-      waveOffset += 0.03;
+      const pad = 10;
+      const toX = (pos: number) => pad + (pos / posSeqLen) * (width - 2 * pad);
+      const toY = (v: number) => height / 2 - v * (height / 2 - pad);
 
-      const numCurves = 8;
-      for (let c = 0; c < numCurves; c++) {
-        const isSine = c % 2 === 0;
-        const freq = 0.01 + c * 0.018;
-        const alpha = 0.8 - c * 0.08;
-
-        // Sine in charcoal #1A1816, Cosine in terracotta #DE5D35
-        ctx.strokeStyle = isSine
-          ? `rgba(26, 24, 22, ${alpha})`
-          : `rgba(222, 93, 53, ${alpha})`;
-        ctx.lineWidth = 1.5;
+      // Faint gridline at each integer position (PE is only defined there)
+      ctx.strokeStyle = "rgba(26, 24, 22, 0.06)";
+      ctx.lineWidth = 1;
+      for (let pos = 0; pos <= posSeqLen; pos++) {
         ctx.beginPath();
-
-        for (let x = 0; x < width; x += 3) {
-          const pos = (x / width) * curPosSeqLen;
-          const y = isSine
-            ? Math.sin(pos * freq * 10 + waveOffset + c) * 35 + height / 2
-            : Math.cos(pos * freq * 10 + waveOffset + c) * 35 + height / 2;
-
-          if (x === 0) ctx.moveTo(x, y);
-          else ctx.lineTo(x, y);
-        }
+        ctx.moveTo(toX(pos), pad);
+        ctx.lineTo(toX(pos), height - pad);
         ctx.stroke();
       }
 
@@ -635,17 +612,34 @@ export default function TransformersArticlePage() {
       ctx.lineTo(width, height / 2);
       ctx.stroke();
 
+      PE_PLOTTED_DIMS.forEach((twoI, c) => {
+        const omega = 1 / 10000 ** (twoI / PE_D_MODEL);
+        const alpha = 0.9 - c * 0.18;
+        for (const isSine of [true, false]) {
+          // Sine (even dims) in charcoal #1A1816, cosine (odd dims) in terracotta #DE5D35
+          ctx.strokeStyle = isSine
+            ? `rgba(26, 24, 22, ${alpha})`
+            : `rgba(222, 93, 53, ${alpha})`;
+          ctx.lineWidth = 1.5;
+          ctx.beginPath();
+          for (let px = 0; px <= width - 2 * pad; px += 2) {
+            const pos = (px / (width - 2 * pad)) * posSeqLen;
+            const v = isSine ? Math.sin(pos * omega) : Math.cos(pos * omega);
+            if (px === 0) ctx.moveTo(toX(pos), toY(v));
+            else ctx.lineTo(toX(pos), toY(v));
+          }
+          ctx.stroke();
+        }
+      });
+
       ctx.restore();
-      animId = requestAnimationFrame(renderWave);
     };
 
-    animId = requestAnimationFrame(renderWave);
-
-    return () => {
-      cancelAnimationFrame(animId);
-      resizeObserver.disconnect();
-    };
-  }, []);
+    draw();
+    const resizeObserver = new ResizeObserver(draw);
+    resizeObserver.observe(canvas);
+    return () => resizeObserver.disconnect();
+  }, [posSeqLen]);
 
   // Compute selected token objects for live cosine rays
   const tokenAObj =
@@ -688,13 +682,26 @@ export default function TransformersArticlePage() {
     ];
   }, []);
 
-  // FFN Layer calculations for Two-Layer Visualizer
-  const ffnActiveNeurons = Math.round(ffnInputVal * 280);
-  const ffnSparsityPct = (100 - (ffnActiveNeurons / 2048) * 100).toFixed(1);
-  const numActiveNodes = Math.min(
-    13,
-    Math.max(1, Math.round((ffnInputVal / 3.0) * 13)),
+  // FFN Layer calculations for Two-Layer Visualizer: run the toy hidden layer
+  // h_j = act(x * w_j + b_j) and count neurons with non-negligible output
+  const ffnHiddenOutputs = useMemo(
+    () =>
+      FFN_TOY_NEURONS.map(({ w, b }) => {
+        const z = ffnInputVal * w + b;
+        return ffnActivation === "relu" ? Math.max(0, z) : gelu(z);
+      }),
+    [ffnInputVal, ffnActivation],
   );
+  // ReLU: active means output > 0 (the rest are exactly 0); GELU never outputs
+  // exact zeros, so count outputs that are non-negligible
+  const isNeuronActive = (h: number) =>
+    ffnActivation === "relu" ? h > 0 : Math.abs(h) >= 0.01;
+  const ffnActiveNeurons = ffnHiddenOutputs.filter(isNeuronActive).length;
+  const ffnSparsityPct = (
+    100 -
+    (ffnActiveNeurons / FFN_HIDDEN_DIM) * 100
+  ).toFixed(1);
+  const hiddenNodeActive = ffnHiddenOutputs.slice(0, 13).map(isNeuronActive);
 
   return (
     <FoldLayout>
@@ -795,7 +802,7 @@ export default function TransformersArticlePage() {
                 <div className="text-[11px] text-[#1A1816] uppercase mb-3 font-bold flex flex-wrap justify-between items-center gap-2 border-b border-[#1A1816]/10 pb-2">
                   <div className="flex items-center gap-2">
                     <span className="w-1.5 h-1.5 rounded-full bg-[#DE5D35]" />
-                    <span>INTERACTIVE BPE TOKENIZER STUDIO</span>
+                    <span>SIMPLIFIED SUBWORD TOKENIZER</span>
                   </div>
                   <span className="text-[#DE5D35] font-bold">
                     {tokens.length} TOKENS EXTRACTED
@@ -829,10 +836,10 @@ export default function TransformersArticlePage() {
                   {tokens.map((tok) => (
                     <button
                       type="button"
-                      key={`token-chip-${tok.id}-${tok.text}`}
+                      key={`token-chip-${tok.pos}`}
                       onClick={() => setInspectedToken(tok)}
                       className={`px-3 py-1.5 rounded-[2px] text-[12px] border transition-all cursor-pointer ${
-                        inspectedToken?.text === tok.text
+                        inspectedToken?.pos === tok.pos
                           ? "bg-[#1A1816] text-[#FAF9F5] border-[#1A1816] font-bold"
                           : "bg-[#F4F1EA] text-[#1A1816] border-[#1A1816]/15 hover:border-[#DE5D35]"
                       }`}
@@ -865,12 +872,20 @@ export default function TransformersArticlePage() {
                     </div>
                     <div>
                       <span className="text-[#75716B] font-bold block mb-1">
-                        ASCII / UTF-8 BYTES
+                        UTF-8 BYTES (HEX)
                       </span>
-                      <span>0x{inspectedToken.bytes}</span>
+                      <span>{inspectedToken.bytes}</span>
                     </div>
                   </div>
                 )}
+
+                <p className="mt-3 text-[10px] text-[#75716B] leading-relaxed">
+                  Simplified demo: words longer than 7 characters are split
+                  after the 5th character and IDs are hashed into a 37,000-entry
+                  range. A real BPE tokenizer learns its merges from corpus
+                  statistics (the original paper used a shared ~37k-token BPE
+                  vocabulary for English–German).
+                </p>
               </div>
             </div>
           </section>
@@ -1418,9 +1433,10 @@ export default function TransformersArticlePage() {
             <div className="border border-[#1A1816]/15 bg-[#FAF9F5] p-6 sm:p-8 rounded-[2px] mb-8">
               <p className="text-[14px] text-[#4A4742] leading-[1.7] mb-6">
                 Because self-attention operates across all positions in parallel
-                with zero recurrence, it is completely permutation-invariant.
-                Shuffling input words computes identical outputs. Vaswani et al.
-                solved this by adding harmonic sine and cosine waves directly
+                with zero recurrence, it has no built-in notion of order: it is
+                permutation-equivariant, so shuffling the input words simply
+                shuffles the outputs the same way. Vaswani et al. solved this by
+                adding sine and cosine waves of different frequencies directly
                 into the embedding vectors:
               </p>
 
@@ -1442,7 +1458,7 @@ export default function TransformersArticlePage() {
                     </span>
                   </div>
                   <div className="flex items-center gap-2 text-[10px]">
-                    <span className="text-[#75716B]">SEQUENCE LENGTH:</span>
+                    <span className="text-[#75716B]">POSITIONS:</span>
                     <input
                       type="range"
                       min="8"
@@ -1467,10 +1483,11 @@ export default function TransformersArticlePage() {
 
                 <div className="text-[10px] text-[#75716B] flex flex-wrap justify-between gap-2">
                   <span>
-                    HIGH FREQUENCIES (Local syntax &amp; immediate neighbours)
+                    Dimension pairs 2i = 0, 32, 64, 128 (darker = lower
+                    dimension = higher frequency)
                   </span>
                   <span>
-                    LOW FREQUENCIES (Long-range global context up to 10,000·2π)
+                    Wavelengths grow from 2π (2i = 0) to ≈10,000·2π (2i = 510)
                   </span>
                 </div>
               </div>
@@ -1781,7 +1798,7 @@ export default function TransformersArticlePage() {
                         28, 46, 64, 82, 100, 118, 136, 154, 172, 190, 208, 226,
                         244,
                       ].map((hidY, hidIdx) => {
-                        const isNodeActive = hidIdx < numActiveNodes;
+                        const isNodeActive = hiddenNodeActive[hidIdx];
                         return (
                           <line
                             key={`w1-syn-${inY}-${hidY}`}
@@ -1806,7 +1823,7 @@ export default function TransformersArticlePage() {
                       244,
                     ].map((hidY, hidIdx) =>
                       [45, 90, 135, 180, 225].map((outY) => {
-                        const isNodeActive = hidIdx < numActiveNodes;
+                        const isNodeActive = hiddenNodeActive[hidIdx];
                         return (
                           <line
                             key={`w2-syn-${hidY}-${outY}`}
@@ -1903,7 +1920,7 @@ export default function TransformersArticlePage() {
                       28, 46, 64, 82, 100, 118, 136, 154, 172, 190, 208, 226,
                       244,
                     ].map((y, i) => {
-                      const isActive = i < numActiveNodes;
+                      const isActive = hiddenNodeActive[i];
                       return (
                         <g key={`hid-node-${y}`}>
                           {isActive && (
@@ -1985,7 +2002,7 @@ export default function TransformersArticlePage() {
                       ACTIVE NEURONS (FIRING)
                     </span>
                     <span className="font-bold text-[#DE5D35]">
-                      {ffnActiveNeurons} / 2048 Neurons Active
+                      {ffnActiveNeurons} / {FFN_HIDDEN_DIM} Neurons Active
                     </span>
                   </div>
                   <div>
@@ -1995,10 +2012,21 @@ export default function TransformersArticlePage() {
                         : "GELU ATTENUATION"}
                     </span>
                     <span className="font-bold text-[#1A1816]">
-                      {ffnSparsityPct}% dead neurons
+                      {ffnSparsityPct}%{" "}
+                      {ffnActivation === "relu"
+                        ? "output exactly 0"
+                        : "near zero (|h| < 0.01)"}
                     </span>
                   </div>
                 </div>
+
+                <p className="mt-3 text-[10px] text-[#75716B] leading-relaxed">
+                  Toy layer: a scalar input x feeds 2,048 hidden neurons with
+                  fixed random weights and slightly negative biases. ReLU zeroes
+                  every negative pre-activation exactly; GELU lets small
+                  negative values through, so it never produces exact zeros. The
+                  13 drawn nodes are the first 13 of the 2,048.
+                </p>
               </div>
             </div>
           </section>
@@ -2105,14 +2133,15 @@ export default function TransformersArticlePage() {
                 <div className="mt-4 p-3 bg-[#F4F1EA] border border-[#1A1816]/10 rounded-[2px] text-[11px] text-[#75716B]">
                   {residualEnabled ? (
                     <span className="text-[#1A1816] font-semibold">
-                      ✓ Gradient Highway Active: Signal flows undiminished
-                      across all 6 layers via the identity skip path.
+                      ✓ Gradient Highway Active: the identity skip path keeps
+                      the signal close to full strength across all 6 layers.
                     </span>
                   ) : (
                     <span className="text-[#DE5D35] font-semibold">
-                      ✗ Vanishing Gradient Failure: Without skip connections,
-                      signal degrades by Layer 4 and vanishes completely by
-                      Layer 6.
+                      ✗ Without skip connections, the signal is multiplied by
+                      each layer&apos;s Jacobian in turn, so any per-layer
+                      shrinkage compounds with depth (shown here with an
+                      illustrative 0.42× per layer).
                     </span>
                   )}
                 </div>
@@ -2138,19 +2167,45 @@ export default function TransformersArticlePage() {
                 {/* Canonical Paper SVG Blueprint */}
                 <div className="flex justify-center p-4 bg-[#FAF9F5] border border-[#1A1816]/15 rounded-[2px]">
                   <svg
-                    viewBox="0 0 420 540"
+                    viewBox="0 0 420 490"
                     className="w-full max-w-[340px] h-auto"
                     style={{ fontFamily: "monospace" }}
                     role="img"
                     aria-label="Transformer Architecture Dual Tower Blueprint"
                   >
                     <title>Transformer Architecture Dual Tower Blueprint</title>
-                    {/* ENCODER TOWER */}
+                    {/* Data-flow spines (drawn first so blocks sit on top) */}
+                    <line
+                      x1="110"
+                      y1="272"
+                      x2="110"
+                      y2="412"
+                      stroke="#1A1816"
+                      strokeWidth="1.2"
+                    />
+                    <line
+                      x1="310"
+                      y1="352"
+                      x2="310"
+                      y2="412"
+                      stroke="#1A1816"
+                      strokeWidth="1.2"
+                    />
+                    <line
+                      x1="310"
+                      y1="98"
+                      x2="310"
+                      y2="42"
+                      stroke="#1A1816"
+                      strokeWidth="1.2"
+                    />
+
+                    {/* ENCODER TOWER (bottom-up: embedding + PE → attention → Add & Norm → FFN → Add & Norm) */}
                     <rect
                       x="30"
-                      y="80"
+                      y="98"
                       width="160"
-                      height="380"
+                      height="174"
                       rx="2"
                       fill="#FAF9F5"
                       stroke="#1A1816"
@@ -2158,43 +2213,20 @@ export default function TransformersArticlePage() {
                       strokeDasharray="4 4"
                     />
                     <text
-                      x="38"
-                      y="100"
-                      fill="#75716B"
-                      fontSize="10"
-                      fontWeight="bold"
-                    >
-                      ENCODER (Nx = 6)
-                    </text>
-
-                    {/* Feed Forward */}
-                    <rect
-                      x="45"
-                      y="125"
-                      width="130"
-                      height="42"
-                      rx="2"
-                      fill="#F4F1EA"
-                      stroke="#1A1816"
-                      strokeWidth="1.2"
-                    />
-                    <text
-                      x="110"
-                      y="150"
+                      x="16"
+                      y="190"
                       textAnchor="middle"
-                      fill="#1A1816"
+                      fill="#75716B"
                       fontSize="11"
                       fontWeight="bold"
                     >
-                      Feed Forward
+                      6×
                     </text>
-
-                    {/* Add & Norm 2 */}
                     <rect
                       x="55"
-                      y="180"
+                      y="108"
                       width="110"
-                      height="28"
+                      height="24"
                       rx="2"
                       fill="#FAF9F5"
                       stroke="#DE5D35"
@@ -2202,7 +2234,7 @@ export default function TransformersArticlePage() {
                     />
                     <text
                       x="110"
-                      y="198"
+                      y="124"
                       textAnchor="middle"
                       fill="#DE5D35"
                       fontSize="10"
@@ -2210,13 +2242,51 @@ export default function TransformersArticlePage() {
                     >
                       Add &amp; Norm
                     </text>
-
-                    {/* Multi-Head Self-Attention */}
                     <rect
                       x="45"
-                      y="225"
+                      y="140"
                       width="130"
-                      height="48"
+                      height="36"
+                      rx="2"
+                      fill="#F4F1EA"
+                      stroke="#1A1816"
+                      strokeWidth="1.2"
+                    />
+                    <text
+                      x="110"
+                      y="162"
+                      textAnchor="middle"
+                      fill="#1A1816"
+                      fontSize="11"
+                      fontWeight="bold"
+                    >
+                      Feed Forward
+                    </text>
+                    <rect
+                      x="55"
+                      y="184"
+                      width="110"
+                      height="24"
+                      rx="2"
+                      fill="#FAF9F5"
+                      stroke="#DE5D35"
+                      strokeWidth="1.2"
+                    />
+                    <text
+                      x="110"
+                      y="200"
+                      textAnchor="middle"
+                      fill="#DE5D35"
+                      fontSize="10"
+                      fontWeight="bold"
+                    >
+                      Add &amp; Norm
+                    </text>
+                    <rect
+                      x="45"
+                      y="216"
+                      width="130"
+                      height="44"
                       rx="2"
                       fill="#FAF9F5"
                       stroke="#1A1816"
@@ -2224,7 +2294,7 @@ export default function TransformersArticlePage() {
                     />
                     <text
                       x="110"
-                      y="248"
+                      y="234"
                       textAnchor="middle"
                       fill="#1A1816"
                       fontSize="11"
@@ -2234,37 +2304,13 @@ export default function TransformersArticlePage() {
                     </text>
                     <text
                       x="110"
-                      y="262"
+                      y="250"
                       textAnchor="middle"
                       fill="#1A1816"
                       fontSize="10"
                     >
                       Attention
                     </text>
-
-                    {/* Add & Norm 1 */}
-                    <rect
-                      x="55"
-                      y="290"
-                      width="110"
-                      height="28"
-                      rx="2"
-                      fill="#FAF9F5"
-                      stroke="#DE5D35"
-                      strokeWidth="1.2"
-                    />
-                    <text
-                      x="110"
-                      y="308"
-                      textAnchor="middle"
-                      fill="#DE5D35"
-                      fontSize="10"
-                      fontWeight="bold"
-                    >
-                      Add &amp; Norm
-                    </text>
-
-                    {/* Input Positional Encoding */}
                     <circle
                       cx="110"
                       cy="380"
@@ -2275,7 +2321,7 @@ export default function TransformersArticlePage() {
                     />
                     <text
                       x="110"
-                      y="384"
+                      y="385"
                       textAnchor="middle"
                       fill="#1A1816"
                       fontSize="14"
@@ -2285,9 +2331,9 @@ export default function TransformersArticlePage() {
                     </text>
                     <rect
                       x="45"
-                      y="415"
+                      y="412"
                       width="130"
-                      height="32"
+                      height="30"
                       rx="2"
                       fill="#EFECE6"
                       stroke="#1A1816"
@@ -2295,7 +2341,7 @@ export default function TransformersArticlePage() {
                     />
                     <text
                       x="110"
-                      y="435"
+                      y="431"
                       textAnchor="middle"
                       fill="#1A1816"
                       fontSize="10"
@@ -2303,13 +2349,23 @@ export default function TransformersArticlePage() {
                     >
                       Input Embedding
                     </text>
+                    <text
+                      x="110"
+                      y="470"
+                      textAnchor="middle"
+                      fill="#75716B"
+                      fontSize="10"
+                      fontWeight="bold"
+                    >
+                      ENCODER
+                    </text>
 
-                    {/* DECODER TOWER */}
+                    {/* DECODER TOWER (bottom-up: embedding + PE → masked attention → Add & Norm → cross-attention → Add & Norm → FFN → Add & Norm) */}
                     <rect
                       x="230"
-                      y="80"
+                      y="98"
                       width="160"
-                      height="380"
+                      height="254"
                       rx="2"
                       fill="#FAF9F5"
                       stroke="#1A1816"
@@ -2317,43 +2373,20 @@ export default function TransformersArticlePage() {
                       strokeDasharray="4 4"
                     />
                     <text
-                      x="238"
-                      y="100"
-                      fill="#75716B"
-                      fontSize="10"
-                      fontWeight="bold"
-                    >
-                      DECODER (Nx = 6)
-                    </text>
-
-                    {/* Decoder Feed Forward */}
-                    <rect
-                      x="245"
-                      y="125"
-                      width="130"
-                      height="42"
-                      rx="2"
-                      fill="#F4F1EA"
-                      stroke="#1A1816"
-                      strokeWidth="1.2"
-                    />
-                    <text
-                      x="310"
-                      y="150"
+                      x="404"
+                      y="230"
                       textAnchor="middle"
-                      fill="#1A1816"
+                      fill="#75716B"
                       fontSize="11"
                       fontWeight="bold"
                     >
-                      Feed Forward
+                      ×6
                     </text>
-
-                    {/* Add & Norm 3 */}
                     <rect
                       x="255"
-                      y="180"
+                      y="108"
                       width="110"
-                      height="28"
+                      height="24"
                       rx="2"
                       fill="#FAF9F5"
                       stroke="#DE5D35"
@@ -2361,7 +2394,7 @@ export default function TransformersArticlePage() {
                     />
                     <text
                       x="310"
-                      y="198"
+                      y="124"
                       textAnchor="middle"
                       fill="#DE5D35"
                       fontSize="10"
@@ -2369,13 +2402,51 @@ export default function TransformersArticlePage() {
                     >
                       Add &amp; Norm
                     </text>
-
-                    {/* Cross-Attention Bridge */}
                     <rect
                       x="245"
-                      y="225"
+                      y="140"
                       width="130"
-                      height="48"
+                      height="36"
+                      rx="2"
+                      fill="#F4F1EA"
+                      stroke="#1A1816"
+                      strokeWidth="1.2"
+                    />
+                    <text
+                      x="310"
+                      y="162"
+                      textAnchor="middle"
+                      fill="#1A1816"
+                      fontSize="11"
+                      fontWeight="bold"
+                    >
+                      Feed Forward
+                    </text>
+                    <rect
+                      x="255"
+                      y="184"
+                      width="110"
+                      height="24"
+                      rx="2"
+                      fill="#FAF9F5"
+                      stroke="#DE5D35"
+                      strokeWidth="1.2"
+                    />
+                    <text
+                      x="310"
+                      y="200"
+                      textAnchor="middle"
+                      fill="#DE5D35"
+                      fontSize="10"
+                      fontWeight="bold"
+                    >
+                      Add &amp; Norm
+                    </text>
+                    <rect
+                      x="245"
+                      y="216"
+                      width="130"
+                      height="44"
                       rx="2"
                       fill="#FAF9F5"
                       stroke="#DE5D35"
@@ -2383,7 +2454,7 @@ export default function TransformersArticlePage() {
                     />
                     <text
                       x="310"
-                      y="248"
+                      y="234"
                       textAnchor="middle"
                       fill="#DE5D35"
                       fontSize="11"
@@ -2393,20 +2464,38 @@ export default function TransformersArticlePage() {
                     </text>
                     <text
                       x="310"
-                      y="262"
+                      y="250"
                       textAnchor="middle"
                       fill="#DE5D35"
                       fontSize="10"
                     >
                       (Q: Dec, K,V: Enc)
                     </text>
-
-                    {/* Masked Multi-Head Attention */}
+                    <rect
+                      x="255"
+                      y="268"
+                      width="110"
+                      height="24"
+                      rx="2"
+                      fill="#FAF9F5"
+                      stroke="#DE5D35"
+                      strokeWidth="1.2"
+                    />
+                    <text
+                      x="310"
+                      y="284"
+                      textAnchor="middle"
+                      fill="#DE5D35"
+                      fontSize="10"
+                      fontWeight="bold"
+                    >
+                      Add &amp; Norm
+                    </text>
                     <rect
                       x="245"
-                      y="295"
+                      y="300"
                       width="130"
-                      height="48"
+                      height="44"
                       rx="2"
                       fill="#FAF9F5"
                       stroke="#1A1816"
@@ -2417,24 +2506,94 @@ export default function TransformersArticlePage() {
                       y="318"
                       textAnchor="middle"
                       fill="#1A1816"
-                      fontSize="11"
+                      fontSize="10"
                       fontWeight="bold"
                     >
-                      Masked Attention
+                      Masked Multi-Head
                     </text>
                     <text
                       x="310"
-                      y="332"
+                      y="334"
                       textAnchor="middle"
                       fill="#1A1816"
                       fontSize="10"
                     >
-                      Causal Lookahead
+                      Attention (causal)
+                    </text>
+                    <circle
+                      cx="310"
+                      cy="380"
+                      r="14"
+                      fill="#FAF9F5"
+                      stroke="#1A1816"
+                      strokeWidth="1.2"
+                    />
+                    <text
+                      x="310"
+                      y="385"
+                      textAnchor="middle"
+                      fill="#1A1816"
+                      fontSize="14"
+                      fontWeight="bold"
+                    >
+                      +
+                    </text>
+                    <rect
+                      x="245"
+                      y="412"
+                      width="130"
+                      height="30"
+                      rx="2"
+                      fill="#EFECE6"
+                      stroke="#1A1816"
+                      strokeWidth="1.2"
+                    />
+                    <text
+                      x="310"
+                      y="431"
+                      textAnchor="middle"
+                      fill="#1A1816"
+                      fontSize="10"
+                      fontWeight="bold"
+                    >
+                      Output Embedding
+                    </text>
+                    <text
+                      x="310"
+                      y="470"
+                      textAnchor="middle"
+                      fill="#75716B"
+                      fontSize="10"
+                      fontWeight="bold"
+                    >
+                      DECODER
                     </text>
 
-                    {/* Cross Attention Bridge Line */}
+                    {/* Output head: Linear → Softmax over the vocabulary */}
+                    <rect
+                      x="245"
+                      y="14"
+                      width="130"
+                      height="28"
+                      rx="2"
+                      fill="#1A1816"
+                      stroke="#1A1816"
+                      strokeWidth="1.2"
+                    />
+                    <text
+                      x="310"
+                      y="32"
+                      textAnchor="middle"
+                      fill="#FAF9F5"
+                      fontSize="10"
+                      fontWeight="bold"
+                    >
+                      Linear → Softmax
+                    </text>
+
+                    {/* Encoder output → K,V of every decoder cross-attention layer */}
                     <path
-                      d="M 110 120 L 110 110 L 220 110 L 220 249 L 245 249"
+                      d="M 110 108 L 110 88 L 210 88 L 210 238 L 245 238"
                       fill="none"
                       stroke="#DE5D35"
                       strokeWidth="1.5"
@@ -2699,7 +2858,9 @@ export default function TransformersArticlePage() {
                 </div>
 
                 {/* Slider Controls */}
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-6 mb-6 p-4 bg-[#F4F1EA] border border-[#1A1816]/10 rounded-[2px]">
+                <div
+                  className={`${samplingMethod === "greedy" ? "hidden" : "grid"} grid-cols-1 sm:grid-cols-2 gap-6 mb-6 p-4 bg-[#F4F1EA] border border-[#1A1816]/10 rounded-[2px]`}
+                >
                   <div>
                     <div className="flex justify-between items-center mb-1 text-[11px]">
                       <span className="text-[#75716B]">TEMPERATURE (T):</span>
